@@ -153,7 +153,11 @@ def read_token_for(config_dir: Path) -> str | None:
     cred = config_dir / ".credentials.json"
     try:
         if cred.exists():
-            return _extract_access_token(cred.read_text())
+            tok = _extract_access_token(cred.read_text())
+            if tok:
+                return tok
+            # File exists but carries no login token (e.g. it only holds MCP
+            # OAuth entries) — fall through to the Keychain rather than giving up.
     except OSError as e:
         log(f"Error reading credentials in {config_dir}: {e}")
     if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
