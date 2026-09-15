@@ -273,6 +273,42 @@ write_gatt() {
 # Build the device payload for one OAuth token. Echoes the JSON payload on
 # success (empty + non-zero return on failure). Pure: no logging, no GATT write
 # — poll() owns picking the active plan and sending it.
+# Emit ",\"wm\":<pct>,\"wmr\":<mins>,\"wmn\":\"<name>\"" for the first
+# model-scoped weekly limit in /api/oauth/usage (kind=weekly_scoped), or
+# nothing when the plan has none or the request fails. Same OAuth token, no
+# model call. Parsed with python3 (already required for the enterprise path).
+fetch_scoped_weekly() {
+    local token="$1" now="$2" body
+    body=$(curl -s --max-time 20 \
+        "https://api.anthropic.com/api/oauth/usage" \
+        -H "Authorization: Bearer $token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "User-Agent: claude-code/2.1.5") || { log "usage endpoint request failed" >&2; return 0; }
+    # stdout is the fragment, so diagnostics go to stderr; body via env (stdin is the script).
+    USAGE_BODY="$body" python3 - "$now" <<'PYEOF'
+import sys, os, json, datetime
+now = float(sys.argv[1])
+try:
+    usage = json.loads(os.environ.get("USAGE_BODY", ""))
+except ValueError as e:
+    print(f"usage endpoint returned non-JSON: {e}", file=sys.stderr)
+    sys.exit(0)
+for lim in (usage.get("limits") or []) if isinstance(usage, dict) else []:
+    if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped" or lim.get("percent") is None:
+        continue
+    scope = lim.get("scope") or {}
+    name = ((scope.get("model") or {}).get("display_name") or scope.get("surface") or "Model")[:11]
+    mins = 0
+    if lim.get("resets_at"):
+        try:
+            mins = max(0, int(round((datetime.datetime.fromisoformat(lim["resets_at"]).timestamp() - now) / 60)))
+        except ValueError:
+            pass
+    print(f',"wm":{int(round(float(lim["percent"])))},"wmr":{mins},"wmn":{json.dumps(name)}', end="")
+    break
+PYEOF
+}
+
 build_payload_for_token() {
     local token="$1"
     [ -z "$token" ] && return 1
@@ -332,13 +368,18 @@ build_payload_for_token() {
         s5h_util=${s5h_util:-0}; s5h_reset=${s5h_reset:-0}
         s7d_util=${s7d_util:-0}; s7d_reset=${s7d_reset:-0}
         s5h_status=${s5h_status:-unknown}
-        payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$s5h_status" -v now="$now" -v clk="$clock_fragment" -v chm="$chime_fragment" \
+        # Model-scoped weekly limit (the "Current week (Fable)" bar in /usage).
+        # Only the plan-usage endpoint exposes it; the rate-limit headers don't.
+        # Best-effort: an empty fragment just hides the panel on the device.
+        local scoped_fragment
+        scoped_fragment=$(fetch_scoped_weekly "$token" "$now")
+        payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$s5h_status" -v now="$now" -v clk="$clock_fragment" -v chm="$chime_fragment" -v scp="$scoped_fragment" \
             'BEGIN {
                 sp = sprintf("%.0f", u5 * 100);
                 sr = (r5 - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
                 wp = sprintf("%.0f", u7 * 100);
                 wr = (r7 - now) / 60; wr = wr > 0 ? sprintf("%.0f", wr) : 0;
-                printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"acct\":\"pro\"%s%s,\"ok\":true}", sp, sr, wp, wr, st, clk, chm;
+                printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"acct\":\"pro\"%s%s%s,\"ok\":true}", sp, sr, wp, wr, st, scp, clk, chm;
             }')
     else
         # Enterprise account — spending-limit model

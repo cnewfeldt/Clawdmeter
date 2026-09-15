@@ -47,6 +47,10 @@ RECONNECT_BACKOFF_CAP = 8  # D-05: fast-reconnect cap (seconds); keeps stacked r
 CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Clawdmeter" / "config"
 
 API_URL = "https://api.anthropic.com/v1/messages"
+# Plan-usage summary. Same OAuth token; free (no model call). The only place
+# model-scoped weekly limits (e.g. the "Fable" week) are exposed — the
+# rate-limit headers on /v1/messages carry only the 5h/7d/overage windows.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
@@ -183,12 +187,72 @@ def add_clock_fields(payload: dict) -> None:
     payload["tf"] = tf
 
 
+def scoped_weekly_fields(usage: dict, now: float) -> dict:
+    """Extract the model-scoped weekly limit ("Current week (Fable)" in /usage)
+    from a /api/oauth/usage response.
+
+    Returns {"wm": pct, "wmr": reset_mins, "wmn": name} or {} when the plan has
+    no scoped weekly limit. Only the first scoped entry is used — the device has
+    one panel for it.
+    """
+    for lim in usage.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        scope = lim.get("scope") or {}
+        model = scope.get("model") or {}
+        name = model.get("display_name") or scope.get("surface") or "Model"
+        pct_val = lim.get("percent")
+        if pct_val is None:
+            continue
+        mins = 0
+        resets_at = lim.get("resets_at")
+        if resets_at:
+            try:
+                r = datetime.datetime.fromisoformat(resets_at).timestamp()
+                mins = max(0, int(round((r - now) / 60.0)))
+            except ValueError:
+                mins = 0
+        return {"wm": int(round(float(pct_val))), "wmr": mins, "wmn": str(name)[:11]}
+    return {}
+
+
+async def fetch_scoped_weekly(http: "httpx.AsyncClient", token: str, now: float) -> dict:
+    """Best-effort fetch of the scoped weekly limit. Any failure is logged and
+    yields {} so the main payload still ships — the device just hides the panel."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": API_HEADERS_TEMPLATE["anthropic-beta"],
+        "User-Agent": API_HEADERS_TEMPLATE["User-Agent"],
+    }
+    try:
+        resp = await http.get(USAGE_URL, headers=headers)
+    except httpx.HTTPError as e:
+        log(f"usage endpoint failed: {e}")
+        return {}
+    if resp.status_code >= 400:
+        log(f"usage endpoint HTTP {resp.status_code}: {resp.text[:200]}")
+        return {}
+    try:
+        body = resp.json()
+    except ValueError as e:
+        log(f"usage endpoint returned non-JSON: {e}")
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    return scoped_weekly_fields(body, now)
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
     try:
         async with httpx.AsyncClient(timeout=20.0) as http:
             resp = await http.post(API_URL, headers=headers, json=API_BODY)
+            # Pro/Max only: the scoped week lives on the usage endpoint, and
+            # there is no point asking when the main call already failed.
+            scoped = {}
+            if resp.status_code < 400 and resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
+                scoped = await fetch_scoped_weekly(http, token, time.time())
     except httpx.HTTPError as e:
         # Network/DNS/timeout — transient. Return None (no toast), retry next tick.
         log(f"API call failed: {e}")
@@ -230,6 +294,7 @@ async def poll_api(token: str) -> dict | None:
             "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
             "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
+            **scoped,   # wm/wmr/wmn when the plan has a model-scoped week (e.g. Fable)
             "ok": True,
         }
     else:

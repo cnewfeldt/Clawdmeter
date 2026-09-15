@@ -10,6 +10,7 @@
 LV_FONT_DECLARE(font_tiempos_56);
 LV_FONT_DECLARE(font_tiempos_34);
 LV_FONT_DECLARE(font_styrene_48);
+LV_FONT_DECLARE(font_styrene_34);
 LV_FONT_DECLARE(font_styrene_28);
 LV_FONT_DECLARE(font_styrene_24);
 LV_FONT_DECLARE(font_styrene_20);
@@ -33,6 +34,17 @@ struct Layout {
     int16_t usage_panel_gap;
     int16_t usage_bar_y;
     int16_t usage_reset_y;
+    // Three-panel variant (Current / Weekly / model-scoped week). Everything is
+    // scaled down so a third full-width bar fits above the status line.
+    int16_t usage3_panel_h;
+    int16_t usage3_panel_gap;
+    int16_t usage3_pad_y;
+    int16_t usage3_bar_y;
+    int16_t usage3_bar_h;
+    int16_t usage3_reset_y;
+    const lv_font_t* usage3_pct_font;
+    const lv_font_t* usage3_pill_font;
+    const lv_font_t* usage3_reset_font;
 
     // Bluetooth screen
     int16_t bt_info_panel_h;
@@ -62,6 +74,15 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 16;
         L.usage_bar_y = 56;
         L.usage_reset_y = 94;
+        L.usage3_panel_h = 100;      // 3×100 + 2×10 = 320 → ends at 420, clear of the status line
+        L.usage3_panel_gap = 10;
+        L.usage3_pad_y = 8;
+        L.usage3_bar_y = 41;
+        L.usage3_bar_h = 16;
+        L.usage3_reset_y = 63;
+        L.usage3_pct_font   = &font_styrene_34;
+        L.usage3_pill_font  = &font_styrene_24;
+        L.usage3_reset_font = &font_styrene_20;
         L.bt_info_panel_h = 160;
         L.bt_reset_zone_h = 110;
         L.bt_title_font    = &font_tiempos_56;
@@ -76,6 +97,15 @@ static void compute_layout(const BoardCaps& c) {
         L.usage_panel_gap = 12;
         L.usage_bar_y = 48;
         L.usage_reset_y = 78;
+        L.usage3_panel_h = 96;       // 3×96 + 2×8 = 304 → ends at 389, clear of the status line
+        L.usage3_panel_gap = 8;
+        L.usage3_pad_y = 8;
+        L.usage3_bar_y = 39;
+        L.usage3_bar_h = 16;
+        L.usage3_reset_y = 59;
+        L.usage3_pct_font   = &font_styrene_34;
+        L.usage3_pill_font  = &font_styrene_20;
+        L.usage3_reset_font = &font_styrene_20;
         L.bt_info_panel_h = 140;
         L.bt_reset_zone_h = 90;
         L.bt_title_font    = &font_tiempos_34;
@@ -119,8 +149,14 @@ static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
+static lv_obj_t* bar_scoped;
+static lv_obj_t* lbl_scoped_pct;
+static lv_obj_t* lbl_scoped_label;
+static lv_obj_t* lbl_scoped_reset;
 static lv_obj_t* panel_session = nullptr;
 static lv_obj_t* panel_weekly = nullptr;
+static lv_obj_t* panel_scoped = nullptr;   // model-scoped week (e.g. "Fable"); hidden unless the daemon sends one
+static bool      three_panels = false;     // current geometry: false = original two-panel, true = compact three-panel
 // Enterprise-only widgets inside panel_session
 static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
@@ -314,6 +350,50 @@ static lv_obj_t* make_usage_panel(lv_obj_t* parent, int y, const char* pill_text
     return panel;
 }
 
+// Re-flow one usage panel between the original two-panel geometry (compact =
+// false, the values make_usage_panel/make_pill/make_bar baked in) and the
+// scaled-down three-panel geometry from the layout table.
+static void style_usage_panel(lv_obj_t* panel, lv_obj_t* pct, lv_obj_t* pill,
+                              lv_obj_t* bar, lv_obj_t* reset, int y, bool compact) {
+    int pad_y = compact ? L.usage3_pad_y : 12;
+    lv_obj_set_pos(panel, L.margin, y);
+    lv_obj_set_height(panel, compact ? L.usage3_panel_h : L.usage_panel_h);
+    lv_obj_set_style_pad_top(panel, pad_y, 0);
+    lv_obj_set_style_pad_bottom(panel, pad_y, 0);
+
+    lv_obj_set_style_text_font(pct, compact ? L.usage3_pct_font : &font_styrene_48, 0);
+
+    lv_obj_set_style_text_font(pill, compact ? L.usage3_pill_font : &font_styrene_28, 0);
+    lv_obj_set_style_pad_left(pill, compact ? 12 : 18, 0);
+    lv_obj_set_style_pad_right(pill, compact ? 12 : 18, 0);
+    lv_obj_set_style_pad_top(pill, compact ? 4 : 6, 0);
+    lv_obj_set_style_pad_bottom(pill, compact ? 4 : 6, 0);
+    lv_obj_align(pill, LV_ALIGN_TOP_RIGHT, 0, 1);
+
+    lv_obj_set_pos(bar, 0, compact ? L.usage3_bar_y : L.usage_bar_y);
+    lv_obj_set_height(bar, compact ? L.usage3_bar_h : 24);
+
+    lv_obj_set_style_text_font(reset, compact ? L.usage3_reset_font : &font_styrene_28, 0);
+    lv_obj_set_pos(reset, 0, compact ? L.usage3_reset_y : L.usage_reset_y);
+}
+
+// Switch the usage view between two and three panels. Only touches the tree
+// when the mode actually changes — every 60 s payload would otherwise re-style.
+static void apply_usage_geometry(bool three) {
+    if (three == three_panels) return;
+    three_panels = three;
+    int h   = three ? L.usage3_panel_h   : L.usage_panel_h;
+    int gap = three ? L.usage3_panel_gap : L.usage_panel_gap;
+    style_usage_panel(panel_session, lbl_session_pct, lbl_session_label,
+                      bar_session, lbl_session_reset, L.content_y, three);
+    style_usage_panel(panel_weekly, lbl_weekly_pct, lbl_weekly_label,
+                      bar_weekly, lbl_weekly_reset, L.content_y + h + gap, three);
+    style_usage_panel(panel_scoped, lbl_scoped_pct, lbl_scoped_label,
+                      bar_scoped, lbl_scoped_reset, L.content_y + 2 * (h + gap), three);
+    if (three) lv_obj_clear_flag(panel_scoped, LV_OBJ_FLAG_HIDDEN);
+    else       lv_obj_add_flag(panel_scoped, LV_OBJ_FLAG_HIDDEN);
+}
+
 // Pairing hint — shown when disconnected so the screen isn't empty and the
 // user knows how to (re)pair. Wording matches the 3-second release gesture.
 static void build_pair_group(lv_obj_t* parent) {
@@ -427,6 +507,14 @@ static void init_usage_screen(lv_obj_t* scr) {
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
+    // Model-scoped week (e.g. "Fable"). Built in the two-panel slot below the
+    // others and hidden; apply_usage_geometry() re-flows all three when data arrives.
+    panel_scoped = make_usage_panel(usage_group,
+                     L.content_y + 2 * (L.usage_panel_h + L.usage_panel_gap), "Model",
+                     &lbl_scoped_pct, &lbl_scoped_label,
+                     &bar_scoped, &lbl_scoped_reset);
+    lv_obj_add_flag(panel_scoped, LV_OBJ_FLAG_HIDDEN);
+
     build_pair_group(usage_container);
     build_idle_group(usage_container);
 
@@ -484,6 +572,10 @@ void ui_update(const UsageData* data) {
 
     int s_pct = (int)(data->session_pct + 0.5f);
 
+    // Enterprise never has a scoped week; the spending/period boxes keep the
+    // two-panel geometry. Must run before the font overrides below.
+    apply_usage_geometry(!data->enterprise && data->has_scoped);
+
     if (data->enterprise) {
         // Spending box: big number-only label + small "%" symbol + desc + pace
         lv_obj_set_style_text_font(lbl_session_pct, &font_tiempos_56, 0);
@@ -494,7 +586,9 @@ void ui_update(const UsageData* data) {
         lv_obj_add_flag(lbl_spending_status,   LV_OBJ_FLAG_HIDDEN);
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_obj_set_style_text_font(lbl_session_pct, &font_styrene_48, 0);
+        // Undo the enterprise Tiempos-56 override, matching the active geometry
+        lv_obj_set_style_text_font(lbl_session_pct,
+                                   three_panels ? L.usage3_pct_font : &font_styrene_48, 0);
         lv_label_set_text(lbl_session_label, "Current");
         lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
@@ -547,6 +641,17 @@ void ui_update(const UsageData* data) {
         lv_obj_set_style_bg_color(bar_weekly, pct_color(data->weekly_pct), LV_PART_INDICATOR);
         format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
         lv_label_set_text(lbl_weekly_reset, buf);
+    }
+
+    if (three_panels) {
+        int m_pct = (int)(data->scoped_pct + 0.5f);
+        lv_label_set_text(lbl_scoped_label, data->scoped_name);
+        lv_obj_align(lbl_scoped_label, LV_ALIGN_TOP_RIGHT, 0, 1);   // width changes with the name
+        lv_label_set_text_fmt(lbl_scoped_pct, "%d%%", m_pct);
+        lv_bar_set_value(bar_scoped, m_pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_scoped, pct_color(data->scoped_pct), LV_PART_INDICATOR);
+        format_reset_time(data->scoped_reset_mins, buf, sizeof(buf));
+        lv_label_set_text(lbl_scoped_reset, buf);
     }
 }
 

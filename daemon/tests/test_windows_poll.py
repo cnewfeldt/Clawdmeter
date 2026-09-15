@@ -9,11 +9,16 @@ Run: python -m pytest daemon/tests/test_windows_poll.py -x -q
 import asyncio
 import json
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from daemon.claude_usage_daemon_windows import AuthError, poll_api
+
+USAGE_FIXTURE = json.loads(
+    (Path(__file__).parent / "fixtures" / "oauth_usage_fable.json").read_text()
+)
 
 
 # ---------------------------------------------------------------------------
@@ -32,9 +37,18 @@ def _make_mock_response(status_code=200, headers=None):
     return resp
 
 
+def _usage_resp(status_code=200, body=None):
+    """Mock of GET /api/oauth/usage — the scoped-weekly (Fable) source."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = "mocked"
+    resp.json = lambda: body if body is not None else USAGE_FIXTURE
+    return resp
+
+
 def _run(coro):
     """Run a coroutine synchronously for synchronous test functions."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +78,7 @@ def test_poll_api_nominal(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = fake_post
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -77,6 +92,37 @@ def test_poll_api_nominal(monkeypatch):
     # reset_minutes allows ±1 minute tolerance
     assert abs(payload["sr"] - 60) <= 1, f"Expected ~60, got {payload['sr']}"
     assert abs(payload["wr"] - 1440) <= 1, f"Expected ~1440, got {payload['wr']}"
+    # Model-scoped week from the usage endpoint rides along on Pro/Max payloads
+    assert payload["wm"] == 24
+    assert payload["wmn"] == "Fable"
+    assert isinstance(payload["wmr"], int) and payload["wmr"] >= 0   # fixture reset vs real clock
+
+
+def test_poll_api_usage_endpoint_failure_still_ships_payload(monkeypatch):
+    """A failing /api/oauth/usage must not sink the main payload — just no wm."""
+    now = time.time()
+    mock_resp = _make_mock_response(
+        status_code=200,
+        headers={
+            "anthropic-ratelimit-unified-5h-utilization": "0.42",
+            "anthropic-ratelimit-unified-5h-reset": str(now + 3600),
+            "anthropic-ratelimit-unified-7d-utilization": "0.10",
+            "anthropic-ratelimit-unified-7d-reset": str(now + 86400),
+            "anthropic-ratelimit-unified-5h-status": "allowed",
+        },
+    )
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.get = AsyncMock(return_value=_usage_resp(status_code=500))
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        payload = _run(poll_api("fake-token"))
+
+    assert payload is not None
+    assert payload["s"] == 42
+    assert "wm" not in payload and "wmn" not in payload
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +146,7 @@ def test_pct_42_percent(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -125,6 +172,7 @@ def test_pct_100_percent(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -152,6 +200,7 @@ def test_pct_empty_string_defaults_to_zero(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -182,6 +231,7 @@ def test_reset_minutes_60_minutes(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -207,6 +257,7 @@ def test_reset_minutes_negative_clamps_to_zero(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -233,6 +284,7 @@ def test_reset_minutes_invalid_string_returns_zero(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -261,6 +313,7 @@ def test_missing_utilization_headers_default_to_zero(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -287,6 +340,7 @@ def test_missing_status_header_defaults_to_unknown(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -305,6 +359,7 @@ def test_poll_api_returns_none_on_4xx(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -319,6 +374,7 @@ def test_poll_api_returns_none_on_5xx(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -340,6 +396,7 @@ def test_poll_api_raises_autherror_on_401_403(status):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -354,6 +411,7 @@ def test_poll_api_returns_none_not_autherror_on_429(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -373,6 +431,7 @@ def test_poll_api_returns_none_on_http_error(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -402,6 +461,7 @@ def test_wire_bytes_compact_json_shape(monkeypatch):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
@@ -445,6 +505,7 @@ def test_poll_api_does_not_log_token(monkeypatch, capsys):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_usage_resp())
     mock_client.post = AsyncMock(return_value=mock_resp)
 
     with patch("httpx.AsyncClient", return_value=mock_client):

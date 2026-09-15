@@ -6,6 +6,10 @@ struct UsageData {
     int session_reset_mins;  // minutes until reset
     float weekly_pct;        // 7-day utilization (Pro/Max only; 0 for Enterprise)
     int weekly_reset_mins;   // minutes until weekly reset (Pro/Max only)
+    bool has_scoped;         // plan has a model-scoped weekly limit (e.g. "Fable")
+    float scoped_pct;        // model-scoped 7-day utilization
+    int scoped_reset_mins;   // minutes until the scoped week resets
+    char scoped_name[12];    // scope display name for the panel pill, e.g. "Fable"
     char status[16];         // "allowed", "limited", etc.
     bool chime;              // play the session-reset chime; false unless daemon opts in
     bool enterprise;         // true = Enterprise spending-limit account

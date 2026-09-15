@@ -220,10 +220,12 @@ The device advertises a custom GATT service alongside the standard HID keyboard 
 JSON payload format (written to RX):
 
 ```json
-{ "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true }
+{ "s": 45, "sr": 120, "w": 28, "wr": 7200, "wm": 24, "wmr": 7200, "wmn": "Fable", "st": "allowed", "ok": true }
 ```
 
 Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+
+`wm` / `wmr` / `wmn` = model-scoped weekly % / reset (minutes) / display name (the "Current week (Fable)" bar in `/usage`). Optional: the daemon reads it from `GET /api/oauth/usage` and omits the fields on plans without a scoped week; the device shows a third panel only when they are present.
 
 ## Recompiling fonts
 
@@ -241,8 +243,8 @@ lv_font_conv --font assets/TiemposText-400-Regular.otf -r 0x20-0x7E \
   --size 56 --format lvgl --bpp 4 --no-compress \
   -o firmware/src/font_tiempos_56.c --lv-include "lvgl.h"
 
-# Styrene B (large numbers 48, panel labels 28, small text 24, minimal 20)
-for size in 48 28 24 20; do
+# Styrene B (large numbers 48, three-panel numbers 34, panel labels 28, small text 24, minimal 20)
+for size in 48 34 28 24 20; do
   lv_font_conv --font assets/StyreneB-Regular.otf -r 0x20-0x7E \
     --size $size --format lvgl --bpp 4 --no-compress \
     -o firmware/src/font_styrene_${size}.c --lv-include "lvgl.h"

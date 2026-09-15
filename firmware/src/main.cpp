@@ -110,6 +110,12 @@ static bool parse_json(const char* json, UsageData* out) {
     out->session_reset_mins = doc["sr"] | -1;
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
+    // Model-scoped week (e.g. the Fable bar in /usage). Absent on plans without
+    // one, on Enterprise, and from older daemons — the panel simply stays hidden.
+    out->has_scoped = !doc["wm"].isNull();
+    out->scoped_pct = doc["wm"] | 0.0f;
+    out->scoped_reset_mins = doc["wmr"] | -1;
+    strlcpy(out->scoped_name, doc["wmn"] | "Model", sizeof(out->scoped_name));
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
     const char* acct = doc["acct"] | "pro";
